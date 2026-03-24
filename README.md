@@ -124,6 +124,8 @@ The benchmark exposes three model controls:
 - `--gateway-model`: optional model value sent to OpenClaw `/v1/responses`; if omitted it defaults to `--agent-model`
 - `--judge-model`: model used by the LLM judge
 
+By default, judge calls run with `--judge-concurrency 10` (10 parallel requests). Gateway QA calls run serially (`--concurrency 1`) because the OpenClaw gateway serializes requests through a single lane queue. For full parallelism across QA calls, use `scripts/run_parallel.py` which splits rows across 4 subprocesses. Output format is identical regardless of concurrency settings.
+
 In a second terminal, enter the following for `memory-core`:
 
 ```bash
@@ -160,7 +162,35 @@ uv run python scripts/run_memory_lancedb_pro.py \
   --skip-ingest
 ```
 
-Both runs write artifacts under `outputs/` by default.
+All runs write artifacts under `outputs/` by default.
+
+### 8b. Parallel runs with `run_parallel.py`
+
+The OpenClaw gateway serializes requests through a single lane queue, so in-process concurrency for QA calls doesn't help. For faster large-scale runs, use `run_parallel.py` which splits rows across 4 subprocesses:
+
+```bash
+uv run python scripts/run_parallel.py \
+  --backend memory-lancedb-pro \
+  --input datasets/locomo10.json \
+  --limit 100 \
+  --gateway http://127.0.0.1:18789 \
+  --agent-model openai/gpt-4.1-mini \
+  --judge-model openai/gpt-4.1-mini \
+  --skip-ingest
+```
+
+This spawns 4 worker processes, each handling a quarter of the rows. When all workers finish, the script merges the JSONL outputs and recomputes `summary.json` into a single output directory. The output format is identical to a single-process run.
+
+All flags from the single-process scripts are supported (`--limit`, `--skip-ingest`, `--judge-concurrency`, etc.). The `--backend` flag selects which runner script to use (`memory-core`, `memory-lancedb`, or `memory-lancedb-pro`).
+
+### Concurrency controls
+
+The benchmark exposes two concurrency settings:
+
+- `--concurrency`: number of concurrent gateway QA requests per process (default: 1, serial). Increasing this is not useful because the gateway serializes via lane queuing.
+- `--judge-concurrency`: number of concurrent LLM judge requests per process (default: 10). This parallelizes calls to the OpenAI API for grading answers.
+
+These flags apply to both the single-process scripts and the parallel wrapper.
 
 ## Sample Results
 

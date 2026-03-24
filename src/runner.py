@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,6 +87,10 @@ class RunConfig:
     timeout_seconds: float
     agent_id: str
     skip_ingest: bool
+    concurrency: int = 1
+    judge_concurrency: int = 10
+    shard_index: int | None = None
+    shard_count: int | None = None
 
 
 def run_benchmark(config: RunConfig) -> Path:
@@ -96,6 +101,8 @@ def run_benchmark(config: RunConfig) -> Path:
     sample_lookup = build_sample_lookup(samples)
     all_rows = flatten_benchmark_rows(samples)
     selected = select_rows(all_rows, config.limit)
+    if config.shard_index is not None and config.shard_count is not None:
+        selected = selected[config.shard_index :: config.shard_count]
     if not selected:
         raise ValueError("No benchmark rows were selected")
 
@@ -122,7 +129,9 @@ def run_benchmark(config: RunConfig) -> Path:
         timeout_seconds=config.timeout_seconds,
     )
 
-    qa_results, qa_traces = _run_qa(gateway, selected, memory_backend=config.run_label)
+    qa_results, qa_traces = _run_qa(
+        gateway, selected, memory_backend=config.run_label, concurrency=config.concurrency
+    )
     _write_jsonl(output_dir / "qa_results.jsonl", (result.to_dict() for result in qa_results))
     _write_jsonl(output_dir / "qa_traces.jsonl", qa_traces)
 
@@ -131,6 +140,7 @@ def run_benchmark(config: RunConfig) -> Path:
         model=config.judge_model,
         base_url=config.judge_base_url,
         token=config.judge_token,
+        concurrency=config.judge_concurrency,
     )
     _write_jsonl(
         output_dir / "judged_results.jsonl",
@@ -169,6 +179,10 @@ def run_cli(run_label: str) -> Path:
         timeout_seconds=args.timeout_seconds,
         agent_id=args.agent_id,
         skip_ingest=args.skip_ingest,
+        concurrency=args.concurrency,
+        judge_concurrency=args.judge_concurrency,
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
     )
     return run_benchmark(config)
 
@@ -243,6 +257,30 @@ def build_parser(run_label: str) -> argparse.ArgumentParser:
         "--skip-ingest",
         action="store_true",
         help="Skip corpus ingestion and query the existing store as-is",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent gateway QA requests (default: 1, serial; the gateway serializes via lane queuing)",
+    )
+    parser.add_argument(
+        "--judge-concurrency",
+        type=int,
+        default=10,
+        help="Number of concurrent judge requests (default: 10)",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Shard index for parallel runs (0-based). Used by run_parallel.py.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help="Total number of shards for parallel runs. Used by run_parallel.py.",
     )
     return parser
 
@@ -474,10 +512,10 @@ def _run_qa(
     rows,
     *,
     memory_backend: str,
+    concurrency: int = 1,
 ) -> tuple[list[QaResult], list[dict[str, object]]]:
-    results: list[QaResult] = []
-    traces: list[dict[str, object]] = []
-    for row in rows:
+
+    def _query_one(idx, row):
         user = user_for_sample(row.sample_id)
         session_key = qa_session_key(row.sample_id, row.benchmark_id)
         try:
@@ -486,74 +524,80 @@ def _run_qa(
                 session_key=session_key,
                 message=qa_prompt(row.question, memory_backend),
             )
-            results.append(
-                QaResult(
-                    benchmark_id=row.benchmark_id,
-                    sample_id=row.sample_id,
-                    qa_index=row.qa_index,
-                    question=row.question,
-                    answer=row.answer,
-                    category=row.category,
-                    evidence=row.evidence,
-                    response=response.text,
-                    latency_seconds=response.latency_seconds,
-                    token_usage=response.token_usage,
-                    error=None,
-                    user=user,
-                    session_key=session_key,
-                )
+            result = QaResult(
+                benchmark_id=row.benchmark_id,
+                sample_id=row.sample_id,
+                qa_index=row.qa_index,
+                question=row.question,
+                answer=row.answer,
+                category=row.category,
+                evidence=row.evidence,
+                response=response.text,
+                latency_seconds=response.latency_seconds,
+                token_usage=response.token_usage,
+                error=None,
+                user=user,
+                session_key=session_key,
             )
-            traces.append(
-                {
-                    "benchmark_id": row.benchmark_id,
-                    "sample_id": row.sample_id,
-                    "qa_index": row.qa_index,
-                    "question": row.question,
-                    "user": user,
-                    "session_key": session_key,
-                    "response_text": response.text,
-                    "output_types": _output_types(response.raw_body),
-                    "function_call_count": len(_function_calls(response.raw_body)),
-                    "function_calls": _function_calls(response.raw_body),
-                    "usage": response.raw_body.get("usage"),
-                    "raw_body": response.raw_body,
-                }
-            )
+            trace = {
+                "benchmark_id": row.benchmark_id,
+                "sample_id": row.sample_id,
+                "qa_index": row.qa_index,
+                "question": row.question,
+                "user": user,
+                "session_key": session_key,
+                "response_text": response.text,
+                "output_types": _output_types(response.raw_body),
+                "function_call_count": len(_function_calls(response.raw_body)),
+                "function_calls": _function_calls(response.raw_body),
+                "usage": response.raw_body.get("usage"),
+                "raw_body": response.raw_body,
+            }
         except GatewayError as exc:
-            results.append(
-                QaResult(
-                    benchmark_id=row.benchmark_id,
-                    sample_id=row.sample_id,
-                    qa_index=row.qa_index,
-                    question=row.question,
-                    answer=row.answer,
-                    category=row.category,
-                    evidence=row.evidence,
-                    response=None,
-                    latency_seconds=None,
-                    token_usage=_empty_token_usage(),
-                    error=str(exc),
-                    user=user,
-                    session_key=session_key,
-                )
+            result = QaResult(
+                benchmark_id=row.benchmark_id,
+                sample_id=row.sample_id,
+                qa_index=row.qa_index,
+                question=row.question,
+                answer=row.answer,
+                category=row.category,
+                evidence=row.evidence,
+                response=None,
+                latency_seconds=None,
+                token_usage=_empty_token_usage(),
+                error=str(exc),
+                user=user,
+                session_key=session_key,
             )
-            traces.append(
-                {
-                    "benchmark_id": row.benchmark_id,
-                    "sample_id": row.sample_id,
-                    "qa_index": row.qa_index,
-                    "question": row.question,
-                    "user": user,
-                    "session_key": session_key,
-                    "response_text": None,
-                    "output_types": [],
-                    "function_call_count": 0,
-                    "function_calls": [],
-                    "usage": None,
-                    "raw_body": None,
-                    "error": str(exc),
-                }
-            )
+            trace = {
+                "benchmark_id": row.benchmark_id,
+                "sample_id": row.sample_id,
+                "qa_index": row.qa_index,
+                "question": row.question,
+                "user": user,
+                "session_key": session_key,
+                "response_text": None,
+                "output_types": [],
+                "function_call_count": 0,
+                "function_calls": [],
+                "usage": None,
+                "raw_body": None,
+                "error": str(exc),
+            }
+        return idx, result, trace
+
+    if concurrency <= 1:
+        pairs = [_query_one(i, row) for i, row in enumerate(rows)]
+    else:
+        pairs = [None] * len(rows)
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_query_one, i, row): i for i, row in enumerate(rows)}
+            for future in as_completed(futures):
+                idx, result, trace = future.result()
+                pairs[idx] = (idx, result, trace)
+
+    results = [p[1] for p in pairs]
+    traces = [p[2] for p in pairs]
     return results, traces
 
 

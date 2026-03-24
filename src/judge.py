@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -19,6 +20,7 @@ def grade_results(
     model: str,
     base_url: str | None = None,
     token: str | None = None,
+    concurrency: int = 1,
 ) -> list[JudgedResult]:
     _, resolved_model = parse_model_ref(model)
     api_key = token or os.environ.get("OPENAI_API_KEY")
@@ -26,33 +28,61 @@ def grade_results(
         raise ValueError("Judge API key is required via --judge-token or OPENAI_API_KEY")
 
     client = OpenAI(api_key=api_key, base_url=base_url)
-    judged: list[JudgedResult] = []
-    sticky_judge_error: str | None = None
-    for result in results:
+
+    def _grade_at(idx: int, result: QaResult) -> tuple[int, JudgedResult]:
         if result.error or not result.response:
-            judged.append(
-                JudgedResult(
-                    benchmark_id=result.benchmark_id,
-                    sample_id=result.sample_id,
-                    category=result.category,
-                    result="WRONG",
-                    reasoning=result.error or "empty_response",
-                    question=result.question,
-                    answer=result.answer,
-                    response=result.response,
-                    error=result.error,
-                )
+            return idx, JudgedResult(
+                benchmark_id=result.benchmark_id,
+                sample_id=result.sample_id,
+                category=result.category,
+                result="WRONG",
+                reasoning=result.error or "empty_response",
+                question=result.question,
+                answer=result.answer,
+                response=result.response,
+                error=result.error,
             )
-            continue
-        if sticky_judge_error:
-            judged.append(_judge_error_result(result, sticky_judge_error))
-            continue
         try:
-            judged.append(_grade_one(client, resolved_model, result))
+            return idx, _grade_one(client, resolved_model, result)
         except Exception as exc:
-            sticky_judge_error = _format_judge_error(exc)
-            judged.append(_judge_error_result(result, sticky_judge_error))
-    return judged
+            return idx, _judge_error_result(result, _format_judge_error(exc))
+
+    if concurrency <= 1:
+        judged: list[JudgedResult] = []
+        sticky_judge_error: str | None = None
+        for result in results:
+            if result.error or not result.response:
+                judged.append(
+                    JudgedResult(
+                        benchmark_id=result.benchmark_id,
+                        sample_id=result.sample_id,
+                        category=result.category,
+                        result="WRONG",
+                        reasoning=result.error or "empty_response",
+                        question=result.question,
+                        answer=result.answer,
+                        response=result.response,
+                        error=result.error,
+                    )
+                )
+                continue
+            if sticky_judge_error:
+                judged.append(_judge_error_result(result, sticky_judge_error))
+                continue
+            try:
+                judged.append(_grade_one(client, resolved_model, result))
+            except Exception as exc:
+                sticky_judge_error = _format_judge_error(exc)
+                judged.append(_judge_error_result(result, sticky_judge_error))
+        return judged
+
+    ordered: list[JudgedResult | None] = [None] * len(results)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_grade_at, i, r): i for i, r in enumerate(results)}
+        for future in as_completed(futures):
+            idx, judged_result = future.result()
+            ordered[idx] = judged_result
+    return ordered  # type: ignore[return-value]
 
 
 def parse_model_ref(model: str) -> tuple[str | None, str]:
